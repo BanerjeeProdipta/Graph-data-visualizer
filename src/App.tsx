@@ -15,6 +15,8 @@ import {
   buildSubgraph,
   nodesInViewport,
   rankNodesByImportance,
+  normalizeToCircle,
+  blendHexColors,
 } from "./utils/graphLod";
 import {
   collectGenreColors,
@@ -120,6 +122,98 @@ function GraphLoader() {
   // during a zoom gesture — routing that through React state would itself cause lag.
   const cameraRatioRef = useRef(sigma.getCamera().ratio);
   const topEdgeNodeIdsRef = useRef<Set<string>>(new Set());
+  const visibleIdsRef = useRef<Set<string>>(new Set());
+  const isInteractingRef = useRef(false);
+  const wheelTimeoutRef = useRef<number | null>(null);
+  const nodeLastSeenRef = useRef<Map<string, number>>(new Map());
+  const nodeAccessCounterRef = useRef(0);
+  const LIVE_GRAPH_NODE_CAP = Math.floor(MAX_VISIBLE_NODES * 1.5);
+  const workerRef = useRef<Worker | null>(null);
+  const workerSeededRef = useRef(false);
+  const jobCounterRef = useRef(0);
+  const pendingJobRef = useRef<number | null>(null);
+
+  const syncSubgraphToSigma = useCallback(
+    (desired: Set<string>) => {
+      const sigmaGraph = sigma.getGraph();
+      const full = fullGraphRef.current!;
+
+      for (const id of desired) {
+        if (!sigmaGraph.hasNode(id)) {
+          sigmaGraph.mergeNode(id, full.getNodeAttributes(id));
+        }
+        sigmaGraph.setNodeAttribute(id, "visible", true);
+        nodeAccessCounterRef.current++;
+        nodeLastSeenRef.current.set(id, nodeAccessCounterRef.current);
+      }
+
+      for (const id of sigmaGraph.nodes()) {
+        if (!desired.has(id)) {
+          sigmaGraph.setNodeAttribute(id, "visible", false);
+        }
+      }
+
+      const addedEdges = new Set<string>();
+      for (const id of desired) {
+        full.forEachEdge(id, (edge, attrs, source, target) => {
+          if (addedEdges.has(edge)) return;
+          if (desired.has(source) && desired.has(target)) {
+            if (!sigmaGraph.hasEdge(edge)) {
+              const sColor = full.getNodeAttribute(source, "color") as string;
+              const tColor = full.getNodeAttribute(target, "color") as string;
+              const blended = blendHexColors(sColor, tColor);
+              sigmaGraph.addEdgeWithKey(edge, source, target, {
+                type: "curved",
+                color: blended,
+                ...attrs,
+              });
+            }
+            addedEdges.add(edge);
+          }
+        });
+      }
+
+      visibleIdsRef.current = new Set(desired);
+
+      const pruneIfNeeded = () => {
+        const cap = LIVE_GRAPH_NODE_CAP;
+        if (sigmaGraph.order <= cap) return;
+
+        const hiddenCandidates: string[] = [];
+        for (const n of sigmaGraph.nodes()) {
+          if (sigmaGraph.getNodeAttribute(n, "visible") === false)
+            hiddenCandidates.push(n);
+        }
+
+        hiddenCandidates.sort(
+          (a, b) =>
+            (nodeLastSeenRef.current.get(a) || 0) -
+            (nodeLastSeenRef.current.get(b) || 0),
+        );
+
+        let excess = sigmaGraph.order - cap;
+        const removable = Math.min(excess, hiddenCandidates.length);
+        for (let i = 0; i < removable; i++) {
+          const id = hiddenCandidates[i];
+          try {
+            sigmaGraph.dropNode(id);
+          } catch (e) {
+            // ignore
+          }
+          nodeLastSeenRef.current.delete(id);
+        }
+
+        if (sigmaGraph.order > cap) {
+          console.warn(
+            "Live graph exceeds cap and not enough hidden nodes to prune.",
+          );
+        }
+      };
+
+      pruneIfNeeded();
+    },
+    [sigma],
+  );
 
   useEffect(() => {
     highlightedRef.current = highlightedNodes;
@@ -134,6 +228,15 @@ function GraphLoader() {
     const fullGraph = fullGraphRef.current;
     const rankedNodeIds = rankedNodeIdsRef.current;
     if (!fullGraph || !rankedNodeIds.length) return;
+
+    // Determine dynamic limit based on camera ratio (coarser at far zooms)
+    const ratio = cameraRatioRef.current;
+    let limit: number;
+    if (ratio > 0.8)
+      limit = 3000; // overview
+    else if (ratio > 0.2)
+      limit = 10000; // mid
+    else limit = MAX_VISIBLE_NODES; // detail
 
     let ids: Set<string>;
 
@@ -159,6 +262,34 @@ function GraphLoader() {
       const marginX = (maxX - minX) * VIEWPORT_MARGIN_RATIO;
       const marginY = (maxY - minY) * VIEWPORT_MARGIN_RATIO;
 
+      // If a worker is available and seeded, offload the ranked ID scan to it.
+      if (workerRef.current && workerSeededRef.current) {
+        const bounds = {
+          minX: minX - marginX,
+          maxX: maxX + marginX,
+          minY: minY - marginY,
+          maxY: maxY + marginY,
+        };
+        jobCounterRef.current++;
+        const jobId = jobCounterRef.current;
+        pendingJobRef.current = jobId;
+        try {
+          workerRef.current.postMessage({
+            type: "query",
+            jobId,
+            bounds,
+            limit,
+          });
+          return; // result will be applied from worker message handler
+        } catch (e) {
+          // If posting to worker fails, fall back to main-thread culling.
+          console.warn(
+            "Worker postMessage failed, falling back to nodesInViewport",
+            e,
+          );
+        }
+      }
+
       ids = new Set(
         nodesInViewport(
           fullGraph,
@@ -169,13 +300,23 @@ function GraphLoader() {
             minY: minY - marginY,
             maxY: maxY + marginY,
           },
-          MAX_VISIBLE_NODES,
+          limit,
         ),
       );
     }
 
     highlightedRef.current.forEach((id) => ids.add(id));
-    loadGraph(buildSubgraph(fullGraph, ids));
+
+    // If sigma has no data yet, do the initial heavy load. Afterwards use
+    // incremental sync to avoid replacing sigma's graph mid-render.
+    if (sigma.getGraph().order === 0) {
+      loadGraph(buildSubgraph(fullGraph, ids));
+      visibleIdsRef.current = new Set(ids);
+      return;
+    }
+
+    // Incrementally sync desired ids into sigma's live graph.
+    syncSubgraphToSigma(ids);
   }, [loadGraph, sigma]);
 
   // Debounces rebuilds so a pan/zoom gesture (which fires many 'updated' events per
@@ -183,10 +324,15 @@ function GraphLoader() {
   const scheduleRebuild = useCallback(() => {
     if (rebuildTimeoutRef.current != null)
       window.clearTimeout(rebuildTimeoutRef.current);
+    // If the user is interacting, use a slightly longer debounce to avoid
+    // rebuilding mid-gesture; final rebuild will also be triggered on gesture end.
+    const delay = isInteractingRef.current
+      ? REBUILD_DEBOUNCE_MS * 3
+      : REBUILD_DEBOUNCE_MS;
     rebuildTimeoutRef.current = window.setTimeout(() => {
       rebuildTimeoutRef.current = null;
       rebuildVisibleSubgraph();
-    }, REBUILD_DEBOUNCE_MS);
+    }, delay);
   }, [rebuildVisibleSubgraph]);
 
   useEffect(() => {
@@ -207,28 +353,12 @@ function GraphLoader() {
           rankedNodeIdsRef.current.slice(0, TOP_EDGE_NODE_COUNT),
         );
 
-        // Lock the coordinate system to the full graph's bounding box so that
-        // loading different subgraphs doesn't recompute the normalization function.
-        // Without this, each subgraph rebuild shifts sigma's internal coordinate
-        // mapping based on the currently-visible nodes' extent — causing the camera
-        // to drift away from the cursor during zoom.
-        let xMin = Infinity,
-          xMax = -Infinity,
-          yMin = Infinity,
-          yMax = -Infinity;
-        graph.forEachNode((_, attr) => {
-          if (attr.x < xMin) xMin = attr.x;
-          if (attr.x > xMax) xMax = attr.x;
-          if (attr.y < yMin) yMin = attr.y;
-          if (attr.y > yMax) yMax = attr.y;
-        });
-        sigma.setCustomBBox({ x: [xMin, xMax], y: [yMin, yMax] });
-        graphBBoxRef.current = {
-          minX: xMin,
-          maxX: xMax,
-          minY: yMin,
-          maxY: yMax,
-        };
+        // Normalize coordinates into a unit circle and lock coordinate system to
+        // the fixed [-1,1] bbox so subsequent subgraph rebuilds don't shift
+        // sigma's internal normalization (prevents camera drift during zoom).
+        normalizeToCircle(graph);
+        sigma.setCustomBBox({ x: [-1, 1], y: [-1, 1] });
+        graphBBoxRef.current = { minX: -1, maxX: 1, minY: -1, maxY: 1 };
 
         setSearchAssets({
           graph,
@@ -238,6 +368,51 @@ function GraphLoader() {
           genreCounts: collectGenreCounts(graph),
         });
         setMinimapGraph(graph);
+        // Instantiate and seed the subgraph worker so viewport queries can run off-thread.
+        try {
+          // Build a lightweight positions array to send to the worker.
+          const nodesArray = graph.nodes().map((id) => ({
+            id,
+            x: graph.getNodeAttribute(id, "x") as number,
+            y: graph.getNodeAttribute(id, "y") as number,
+          }));
+
+          // Vite-friendly worker instantiation
+          const w = new Worker(
+            new URL("./workers/subgraphWorker.ts", import.meta.url),
+            {
+              type: "module",
+            },
+          );
+          workerRef.current = w;
+          w.onmessage = (ev: MessageEvent) => {
+            const d = ev.data as any;
+            if (!d || !d.type) return;
+            if (d.type === "init:ack") {
+              workerSeededRef.current = true;
+              return;
+            }
+            if (d.type === "result") {
+              const jobId: number = d.jobId;
+              if (pendingJobRef.current !== jobId) return;
+              pendingJobRef.current = null;
+              const ids = new Set<string>(d.ids || []);
+              syncSubgraphToSigma(ids);
+            }
+          };
+
+          w.postMessage({
+            type: "init",
+            nodes: nodesArray,
+            rankedNodeIds: rankedNodeIdsRef.current,
+          });
+        } catch (err) {
+          console.warn(
+            "Failed to start subgraph worker, falling back to main-thread culling.",
+            err,
+          );
+        }
+
         rebuildVisibleSubgraph();
         setLoading(false);
       })
@@ -248,6 +423,14 @@ function GraphLoader() {
 
     return () => {
       cancelled = true;
+      if (workerRef.current) {
+        try {
+          workerRef.current.terminate();
+        } catch (e) {
+          // ignore
+        }
+        workerRef.current = null;
+      }
     };
   }, [rebuildVisibleSubgraph]);
 
@@ -267,6 +450,57 @@ function GraphLoader() {
         window.clearTimeout(rebuildTimeoutRef.current);
     };
   }, [sigma, scheduleRebuild]);
+
+  // Interaction listeners: mark when the user is actively interacting (pointer/wheel)
+  // so we avoid rebuilding mid-gesture and instead rebuild once at gesture end.
+  useEffect(() => {
+    const container = sigma.getContainer();
+    if (!container) return;
+
+    const onPointerDown = () => {
+      isInteractingRef.current = true;
+      if (rebuildTimeoutRef.current != null) {
+        window.clearTimeout(rebuildTimeoutRef.current);
+        rebuildTimeoutRef.current = null;
+      }
+    };
+
+    const onPointerUp = () => {
+      isInteractingRef.current = false;
+      rebuildVisibleSubgraph();
+    };
+
+    const onWheel = () => {
+      isInteractingRef.current = true;
+      if (wheelTimeoutRef.current != null) {
+        window.clearTimeout(wheelTimeoutRef.current);
+        wheelTimeoutRef.current = null;
+      }
+      wheelTimeoutRef.current = window.setTimeout(() => {
+        isInteractingRef.current = false;
+        rebuildVisibleSubgraph();
+        wheelTimeoutRef.current = null;
+      }, 150);
+    };
+
+    container.addEventListener("pointerdown", onPointerDown);
+    container.addEventListener("pointerup", onPointerUp);
+    container.addEventListener("touchstart", onPointerDown);
+    container.addEventListener("touchend", onPointerUp);
+    container.addEventListener("wheel", onWheel, { passive: true });
+
+    return () => {
+      container.removeEventListener("pointerdown", onPointerDown);
+      container.removeEventListener("pointerup", onPointerUp);
+      container.removeEventListener("touchstart", onPointerDown);
+      container.removeEventListener("touchend", onPointerUp);
+      container.removeEventListener("wheel", onWheel as EventListener);
+      if (wheelTimeoutRef.current != null) {
+        window.clearTimeout(wheelTimeoutRef.current);
+        wheelTimeoutRef.current = null;
+      }
+    };
+  }, [sigma, rebuildVisibleSubgraph]);
 
   // Soft clamp after gesture end (avoid per-frame clamping during camera 'updated')
   useEffect(() => {
@@ -332,6 +566,9 @@ function GraphLoader() {
       edgeReducer: (edge, data) => {
         const src = graph.source(edge);
         const tgt = graph.target(edge);
+        const srcVisible = graph.getNodeAttribute(src, "visible") !== false;
+        const tgtVisible = graph.getNodeAttribute(tgt, "visible") !== false;
+        if (!srcVisible || !tgtVisible) return { ...data, hidden: true };
         const ratio = cameraRatioRef.current;
         // Thinner edges as you zoom in so they don't visually overwhelm the nodes.
         const edgeSize = Math.max(0.05, 0.5 * ratio);
@@ -354,6 +591,10 @@ function GraphLoader() {
         return { ...data, hidden: true };
       },
       nodeReducer: (node, data) => {
+        // Hide nodes that are not part of the current visible set.
+        const isVisible = graph.getNodeAttribute(node, "visible") !== false;
+        if (!isVisible) return { ...data, hidden: true };
+
         let result = data;
         const isHovered = hoveredNode === node;
         const isHighlighted = highlightedNodes.has(node);

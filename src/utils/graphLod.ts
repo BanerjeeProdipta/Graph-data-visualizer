@@ -46,6 +46,51 @@ export function rankNodesByImportance(graph: Graph): string[] {
     );
 }
 
+// Normalize node coordinates so the whole dataset fits inside a unit circle
+// centered at (0,0). Useful when the rendering/clip expects data in [-1,1].
+export function normalizeToCircle(graph: Graph): void {
+  const n = graph.order;
+  if (!n) return;
+
+  // Centroid
+  let cx = 0;
+  let cy = 0;
+  graph.forEachNode((_id, a) => {
+    const x = Number((a as any).x) || 0;
+    const y = Number((a as any).y) || 0;
+    cx += x;
+    cy += y;
+  });
+  cx /= n;
+  cy /= n;
+
+  // Max radius from centroid
+  let maxR = 0;
+  graph.forEachNode((_id, a) => {
+    const x = Number((a as any).x) || 0;
+    const y = Number((a as any).y) || 0;
+    const d = Math.hypot(x - cx, y - cy);
+    if (d > maxR) maxR = d;
+  });
+
+  if (maxR <= 0) {
+    // Degenerate: collapse to origin
+    graph.forEachNode((id) => {
+      graph.setNodeAttribute(id, "x", 0);
+      graph.setNodeAttribute(id, "y", 0);
+    });
+    return;
+  }
+
+  // Remap into unit circle
+  graph.forEachNode((id, a) => {
+    const x = Number((a as any).x) || 0;
+    const y = Number((a as any).y) || 0;
+    graph.setNodeAttribute(id, "x", (x - cx) / maxR);
+    graph.setNodeAttribute(id, "y", (y - cy) / maxR);
+  });
+}
+
 export interface GraphBounds {
   minX: number;
   maxX: number;
@@ -84,7 +129,7 @@ export function nodesInViewport(
 // Blends two hex colors into an rgba string at a given alpha. Used to give each edge a
 // color that visually bridges its source and target nodes — the 50/50 mix of both endpoint
 // colors makes edges feel like a smooth gradient connection rather than a monochrome line.
-function blendHexColors(c1: string, c2: string, alpha = 0.12): string {
+export function blendHexColors(c1: string, c2: string, alpha = 0.12): string {
   const r1 = parseInt(c1.slice(1, 3), 16);
   const g1 = parseInt(c1.slice(3, 5), 16);
   const b1 = parseInt(c1.slice(5, 7), 16);
