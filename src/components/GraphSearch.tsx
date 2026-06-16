@@ -268,6 +268,7 @@ export function GraphSearch({
     <div
       ref={wrapRef}
       className="absolute top-4 left-4 z-10 flex w-72 flex-col gap-2 rounded-lg border border-white/10 bg-black/70 p-3 text-white backdrop-blur-sm"
+      style={{ pointerEvents: "auto" }}
     >
       {/* Artist search */}
       <div className="relative">

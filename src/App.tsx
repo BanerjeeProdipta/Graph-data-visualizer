@@ -7,6 +7,7 @@ import {
   useSetSettings,
   useSigma,
 } from "@react-sigma/core";
+import { safeOn, safeOff } from "./lib/sigmaEvents";
 import "@react-sigma/core/lib/style.css";
 import { loadGraphData } from "./utils/csvLoader";
 import {
@@ -259,60 +260,49 @@ function GraphLoader() {
       cameraRatioRef.current = camera.ratio;
       scheduleRebuild();
     };
-    camera.on("updated", handleCameraUpdate);
+    safeOn(camera, "updated", handleCameraUpdate);
     return () => {
-      camera.removeListener("updated", handleCameraUpdate);
+      safeOff(camera, "updated", handleCameraUpdate);
       if (rebuildTimeoutRef.current != null)
         window.clearTimeout(rebuildTimeoutRef.current);
     };
   }, [sigma, scheduleRebuild]);
 
-  // Clamp camera center to graph bounding box so user cannot drag outside model area
+  // Soft clamp after gesture end (avoid per-frame clamping during camera 'updated')
   useEffect(() => {
-    const camera = sigma.getCamera();
-    const handleClamp = () => {
+    const container = sigma.getContainer();
+    if (!container) return;
+
+    const clampAfterGesture = () => {
       const b = graphBBoxRef.current;
       if (!b) return;
-      const container = sigma.getContainer();
+
+      const camera = sigma.getCamera();
       const c1 = sigma.viewportToGraph({ x: 0, y: 0 });
       const c2 = sigma.viewportToGraph({
         x: container.clientWidth,
         y: container.clientHeight,
       });
+
       const cx = (c1.x + c2.x) / 2;
       const cy = (c1.y + c2.y) / 2;
       const hx = Math.abs(c2.x - c1.x) / 2;
       const hy = Math.abs(c2.y - c1.y) / 2;
 
-      let targetX = cx;
-      let targetY = cy;
+      const targetX = Math.max(b.minX + hx, Math.min(b.maxX - hx, cx));
+      const targetY = Math.max(b.minY + hy, Math.min(b.maxY - hy, cy));
 
-      const minCX = b.minX + hx;
-      const maxCX = b.maxX - hx;
-      const minCY = b.minY + hy;
-      const maxCY = b.maxY - hy;
-
-      if (minCX > maxCX) {
-        targetX = (b.minX + b.maxX) / 2;
-      } else {
-        if (cx < minCX) targetX = minCX;
-        if (cx > maxCX) targetX = maxCX;
-      }
-
-      if (minCY > maxCY) {
-        targetY = (b.minY + b.maxY) / 2;
-      } else {
-        if (cy < minCY) targetY = minCY;
-        if (cy > maxCY) targetY = maxCY;
-      }
-
-      if (Math.abs(targetX - cx) > 1e-6 || Math.abs(targetY - cy) > 1e-6) {
-        camera.animate({ x: targetX, y: targetY }, { duration: 120 });
+      if (Math.abs(targetX - cx) > 1e-4 || Math.abs(targetY - cy) > 1e-4) {
+        camera.animate({ x: targetX, y: targetY }, { duration: 200 });
       }
     };
 
-    camera.on("updated", handleClamp);
-    return () => camera.removeListener("updated", handleClamp);
+    container.addEventListener("mouseup", clampAfterGesture);
+    container.addEventListener("touchend", clampAfterGesture);
+    return () => {
+      container.removeEventListener("mouseup", clampAfterGesture);
+      container.removeEventListener("touchend", clampAfterGesture);
+    };
   }, [sigma]);
 
   useEffect(() => {
@@ -503,7 +493,7 @@ function GraphLoader() {
   if (!searchAssets) return null;
 
   return (
-    <>
+    <div style={{ pointerEvents: "none" }}>
       <GraphSearch
         graph={searchAssets.graph}
         rankedNodeIds={searchAssets.rankedNodeIds}
@@ -523,7 +513,7 @@ function GraphLoader() {
           onSelectArtist={handleSelectArtist}
         />
       )}
-    </>
+    </div>
   );
 }
 
